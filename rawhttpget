@@ -1,0 +1,202 @@
+#!/usr/bin/env python3
+import argparse
+from urllib.parse import urlparse
+from collections import OrderedDict
+import socket
+import sys
+from struct import *
+from tcp import TCPConnection, TCPPacket
+from utils import verify_checksum, create_GET, write_to_file
+
+   
+def create_sender_socket():
+    """
+    Creates a sender socket 
+
+    Returns:
+        sender_socket (socket): Sender socket
+    """
+    try:
+        sender_socket = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
+    except Exception as e:
+        print("Socket Error:", e)
+        sys.exit()
+    return sender_socket
+
+def create_receiver_socket():
+    """
+    Creates a receiver socket
+
+    Returns:
+        receiver_socket (socket): Receiver socket
+    """
+    receiver_socket = None
+    try:
+        receiver_socket = socket.socket(socket.AF_INET,socket.SOCK_RAW,socket.IPPROTO_TCP)
+    except (socket.error):
+        pass
+    return receiver_socket
+
+def send_http_get(tcp_connection: TCPConnection, receiver_socket: socket, sender_socket: socket, tcp_seq_no: int, tcp_ack_no: int, cwnd: int, mss: int, send_string: str):
+    """
+    Sends http get request packet to server using congestion window
+
+    Args:
+        tcp_connection (TCPConnection): TCP Connection object
+        receiver_socket (socket): Receiver socket object
+        sender_socket (socket): Sender socket object
+        tcp_seq_no (int): Sequence number for TCP header
+        tcp_ack_no (int): Acknowledgment number for TCP header
+        cwnd (int): Congestion window 
+        mss (int): Maximum segment size
+        send_string (str): HTTP GET request string
+    """
+    current_index = 0
+    slow_start_flag = 1
+    last_segment = 0
+
+    # if slow_start, then set cwnd = 1
+    if (slow_start_flag == 1):						
+        slow_start_flag = 0
+        cwnd = 1
+    else:									
+        current_index = current_index + cwnd*mss
+        # max cwnd is 1000			
+        cwnd = min(2*cwnd,1000)							
+        
+    # if all the data is sent, return
+    if (len(send_string) - current_index  <= 0):				
+        return
+    
+    if (len(send_string) - current_index > cwnd*mss):
+        # collect data from send_string and put it in buffer
+        buffer = send_string[current_index:(current_index + cwnd)]	
+    else: 									
+        last_segment = 1
+           
+    # sending the http get request packet 
+    tcp_packet = TCPPacket(HOST_NAME)
+    tcp_packet.send(sender_socket, tcp_seq_no, tcp_ack_no, 0, 1, 0, 1, send_string)
+    
+    # checking to see if ack is received from send request
+    try:
+        tcp_seq_no_received, mss = tcp_connection.verify_ack(receiver_socket, tcp_seq_no, 40, len(send_string))
+    except TimeoutError:
+        tcp_packet.send(sender_socket, tcp_seq_no, tcp_ack_no, 0, 1, 0, 1, send_string)
+        try:
+            tcp_seq_no_received, mss = tcp_connection.verify_ack(receiver_socket, tcp_seq_no, 40, len(send_string))
+        except TimeoutError:
+            print("Failed to receive ack after sending data")
+            sys.exit(-1)
+
+    # if ack is received and all data is sent, then return
+    if tcp_seq_no_received and last_segment == 1:
+        return
+    else:
+        send_http_get(tcp_connection, receiver_socket, sender_socket, tcp_seq_no + cwnd * mss, tcp_ack_no, cwnd, mss, buffer)
+  
+def get_response(tcp_connection: TCPConnection, receiver_socket, sender_socket, tcp_ack_no):
+    """
+    Gets the resposne page from the server
+
+    Args:
+        tcp_connection (TCPConnection): TCP Connection object
+        receiver_socket (_type_): Receiver socket object
+        sender_socket (_type_): Sender socket object
+        tcp_ack_no (_type_): Acknowledgment number for TCP header
+
+    Returns:
+        data_dict (dict) : Stores the ordered data receievd
+        tcp_seq_no_received (int): Received sequence number
+        tcp_ack_no_received (int): Received acknowledgment number
+    """
+    data_dict = OrderedDict()								
+    tear_down_flag = 0	
+    tcp_ack_no = tcp_ack_no + 1
+
+    # while connection should persist 
+    while(tear_down_flag != 1):
+
+        # receiving data
+        tcp_packet = TCPPacket(HOST_NAME)
+        received_packet = tcp_packet.receive(receiver_socket)
+
+        # unpacking TCP header
+        tcp_header_temp = received_packet[20:40]
+        tcp_header=unpack('!HHLLBBHHH',tcp_header_temp)
+        tcp_fin_ack_psh_flag_received = tcp_header[5] & 25
+        tcp_seq_no_received = int(tcp_header[2])
+        tcp_ack_no_received = int(tcp_header[3])
+        
+        # store the received data in an ordered dictionery with key as sequence number
+        data = received_packet[40:]
+        data_dict[tcp_seq_no_received] = data
+
+        # If checksum is true, then data is valid, and send an ack back to the server
+        if verify_checksum(received_packet, len(data)):
+            tcp_ack_no = tcp_seq_no_received + len(data) 
+            tcp_packet = TCPPacket(HOST_NAME)
+            tcp_packet.send(sender_socket, tcp_ack_no_received, tcp_ack_no, 0, 1, 0, 0)
+
+        # when we receive a FIN/PSH/ACK flag, then end the connection
+        if (tcp_fin_ack_psh_flag_received == 25):					 
+            tear_down_flag = 1	
+            tcp_packet = TCPPacket(HOST_NAME)
+            tcp_packet.send(sender_socket, tcp_ack_no_received, tcp_ack_no + 1, 0, 1, 1, 0)
+
+            try:
+                tcp_seq_no_received, tcp_ack_no_received, mss = tcp_connection.verify_ack_fin(receiver_socket, tcp_ack_no_received, 40)
+            except TimeoutError:
+                tcp_packet.send(sender_socket, tcp_ack_no_received, tcp_ack_no + 1, 0, 1, 1, 0)
+                try:
+                    tcp_seq_no_received, tcp_ack_no_received, mss = tcp_connection.verify_ack_fin(receiver_socket, tcp_ack_no_received, 40)
+                except TimeoutError:
+                    print("Failed to receive ack after sending FIN/ACK")
+                    sys.exit(-1)
+
+    return data_dict, tcp_seq_no_received, tcp_ack_no_received
+
+def main():
+
+    global HOST_NAME
+    
+    # Parser to store the command line argument URL
+    parser = argparse.ArgumentParser()
+    parser.add_argument('URL')
+
+    url = parser.parse_args().URL
+    HOST_NAME = urlparse(url).netloc
+    PATH_NAME = urlparse(url).path
+
+    # create sender socket
+    sender_socket = create_sender_socket()
+
+    # create receiver socket
+    receiver_socket = create_receiver_socket()
+
+    tcp_connection = TCPConnection(HOST_NAME)
+
+    # perform three-way handshake to establish connection between client and server
+    tcp_seq_no, tcp_ack_no, mss = tcp_connection.three_way_handshake(sender_socket, receiver_socket)
+
+    # contruct the HTTP GET request to send to server
+    request_string = create_GET(HOST_NAME, PATH_NAME)
+		
+    # send the HTTP GET request packet to the server
+    send_http_get(tcp_connection, receiver_socket, sender_socket, tcp_seq_no, tcp_ack_no + 1, 3, mss, request_string)
+
+    # receive the response in the form of a dictionary
+    http_response_dict, tcp_seq_no, tcp_ack_no = get_response(tcp_connection, receiver_socket, sender_socket, tcp_ack_no)	
+
+    # if all the data was received, store it in a file
+    if tcp_seq_no:
+        write_to_file(http_response_dict, PATH_NAME)
+    else:
+        print("Something went wrong")
+
+    # close the socket connection
+    sender_socket.close()
+    receiver_socket.close()          
+
+if __name__ == "__main__":
+    main()
